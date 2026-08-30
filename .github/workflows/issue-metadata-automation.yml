@@ -1,0 +1,172 @@
+name: Issue metadata automation
+
+# 기존 이슈 템플릿(.github/ISSUE_TEMPLATE/issue.yml)은 건드리지 않고,
+# 그 템플릿이 만들어내는 본문 텍스트만 읽어서 담당자/프로젝트/도메인/타입/마일스톤을 자동 설정합니다.
+# 라벨은 기존 labeler.yml + pr-labeler.yml(jimschubert/labeler-action)이 이미
+# "🌿 브랜치 타입" 값(feat/fix/docs/...)을 인식해 처리하고 있어 이 워크플로에서는 건드리지 않습니다.
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  automate:
+    runs-on: ubuntu-latest
+    steps:
+      # 1) 이슈 작성자를 담당자로 자동 지정
+      - name: Assign creator
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.addAssignees({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              assignees: [context.payload.issue.user.login],
+            });
+
+      # 2) 이슈를 프로젝트(1개)에 자동 추가 + "📦 도메인 이름" 값으로 Domain 필드 매칭
+      #    Projects v2 GraphQL은 기본 GITHUB_TOKEN 권한 밖이라 PAT(PROJECTS_TOKEN)가 필요합니다.
+      - name: Add to project & set Domain field
+        if: ${{ vars.PROJECT_ID != '' && secrets.PROJECTS_TOKEN != '' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECTS_TOKEN }}
+          script: |
+            const projectId = "${{ vars.PROJECT_ID }}";
+            const domainFieldId = "${{ vars.DOMAIN_FIELD_ID }}";
+            const issueNodeId = context.payload.issue.node_id;
+            const body = context.payload.issue.body || "";
+
+            function getField(label) {
+              const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+              const regex = new RegExp(`###\\s+${escaped}\\s*\\n+([\\s\\S]*?)(?=\\n+###\\s+|$)`);
+              const match = body.match(regex);
+              return match ? match[1].trim() : null;
+            }
+
+            // 2-1) 프로젝트에 아이템으로 추가
+            const addResult = await github.graphql(`
+              mutation($projectId: ID!, $contentId: ID!) {
+                addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+                  item { id }
+                }
+              }
+            `, { projectId, contentId: issueNodeId });
+            const itemId = addResult.addProjectV2ItemById.item.id;
+
+            // 2-2) 이슈 템플릿의 "📦 도메인 이름" 입력값 (예: user, policy, ai, others)
+            const domainValue = getField("📦 도메인 이름");
+            if (!domainValue || !domainFieldId) return;
+
+            // 2-3) Domain 필드의 옵션 목록을 조회해 이름이 같은 옵션을 찾음 (대소문자 무시)
+            const fieldResult = await github.graphql(`
+              query($projectId: ID!) {
+                node(id: $projectId) {
+                  ... on ProjectV2 {
+                    field(name: "Domain") {
+                      ... on ProjectV2SingleSelectField {
+                        id
+                        options { id name }
+                      }
+                    }
+                  }
+                }
+              }
+            `, { projectId });
+            const options = fieldResult.node.field?.options || [];
+            const matched = options.find(o => o.name.toLowerCase() === domainValue.toLowerCase());
+            if (!matched) {
+              core.warning(`Domain 옵션 중 "${domainValue}" 와 일치하는 항목이 없습니다. (Project의 Domain 옵션 이름을 확인하세요)`);
+              return;
+            }
+
+            await github.graphql(`
+              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: $projectId, itemId: $itemId, fieldId: $fieldId,
+                  value: { singleSelectOptionId: $optionId }
+                }) { projectV2Item { id } }
+              }
+            `, { projectId, itemId, fieldId: domainFieldId, optionId: matched.id });
+
+      # 3) Type 지정: "🌿 브랜치 타입" 값이 fix -> Bug, feat -> Feature, 나머지 전부 -> Task
+      - name: Set issue type
+        if: ${{ secrets.PROJECTS_TOKEN != '' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECTS_TOKEN }}
+          script: |
+            const body = context.payload.issue.body || "";
+
+            function getField(label) {
+              const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+              const regex = new RegExp(`###\\s+${escaped}\\s*\\n+([\\s\\S]*?)(?=\\n+###\\s+|$)`);
+              const match = body.match(regex);
+              return match ? match[1].trim() : null;
+            }
+
+            const branchType = (getField("🌿 브랜치 타입") || "").toLowerCase();
+
+            let targetTypeName = "Task";
+            if (branchType === "fix" || branchType === "hotfix") targetTypeName = "Bug";
+            else if (branchType === "feat") targetTypeName = "Feature";
+
+            const typesResult = await github.graphql(`
+              query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                  issueTypes(first: 20) { nodes { id name } }
+                }
+              }
+            `, { owner: context.repo.owner, repo: context.repo.repo });
+
+            const issueTypes = typesResult.repository.issueTypes?.nodes || [];
+            const target = issueTypes.find(t => t.name.toLowerCase() === targetTypeName.toLowerCase());
+            if (!target) {
+              core.warning(`저장소에 "${targetTypeName}" 이슈 타입이 정의되어 있지 않습니다. 조직/저장소 설정에서 먼저 만들어주세요.`);
+              return;
+            }
+
+            await github.graphql(`
+              mutation($issueId: ID!, $issueTypeId: ID!) {
+                updateIssue(input: { id: $issueId, issueTypeId: $issueTypeId }) {
+                  issue { id }
+                }
+              }
+            `, { issueId: context.payload.issue.node_id, issueTypeId: target.id });
+
+      # 4) 마일스톤 자동 선택 (2026-09-06 기준, Asia/Seoul)
+      - name: Assign milestone by date
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const cutoverDate = "2026-09-06";
+            const currentTitle = "${{ vars.MILESTONE_CURRENT_TITLE }}";
+            const nextTitle = "${{ vars.MILESTONE_NEXT_TITLE }}";
+            if (!currentTitle || !nextTitle) return;
+
+            const nowInSeoul = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+            const todayStr = nowInSeoul.toISOString().slice(0, 10);
+            const targetTitle = todayStr >= cutoverDate ? nextTitle : currentTitle;
+
+            const { data: milestones } = await github.rest.issues.listMilestones({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              per_page: 100,
+            });
+            const target = milestones.find(m => m.title === targetTitle);
+            if (!target) {
+              core.warning(`"${targetTitle}" 마일스톤을 찾을 수 없습니다. 이름을 확인해주세요.`);
+              return;
+            }
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              milestone: target.number,
+            });
