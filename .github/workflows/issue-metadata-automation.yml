@@ -1,12 +1,17 @@
-name: Issue metadata automation
+name: Issue metadata automation (reusable)
 
+# 이 파일은 kb-say-young/.github 리포에만 존재하는 "재사용 가능한 워크플로"입니다.
+# 직접 실행되지 않고, 각 실제 저장소의 caller 워크플로가 uses: 로 호출해야 동작합니다.
 # 기존 이슈 템플릿(.github/ISSUE_TEMPLATE/issue.yml)은 건드리지 않고,
 # 그 템플릿이 만들어내는 본문 텍스트만 읽어서 담당자/프로젝트/도메인/타입/마일스톤을 자동 설정합니다.
-# 라벨은 기존 labeler.yml + pr-labeler.yml(jimschubert/labeler-action)이 이미
-# "🌿 브랜치 타입" 값(feat/fix/docs/...)을 인식해 처리하고 있어 이 워크플로에서는 건드리지 않습니다.
+# 라벨은 각 저장소의 기존 labeler.yml + pr-labeler.yml이 이미 처리하므로 여기서는 다루지 않습니다.
 
 on:
   workflow_call:
+    secrets:
+      PROJECTS_TOKEN:
+        required: false
+        description: "Projects(v2) 및 Issue Type 수정 권한이 있는 fine-grained PAT"
 
 permissions:
   issues: write
@@ -37,7 +42,6 @@ jobs:
           github-token: ${{ secrets.PROJECTS_TOKEN }}
           script: |
             const projectId = "${{ vars.PROJECT_ID }}";
-            const domainFieldId = "${{ vars.DOMAIN_FIELD_ID }}";
             const issueNodeId = context.payload.issue.node_id;
             const body = context.payload.issue.body || "";
 
@@ -60,9 +64,11 @@ jobs:
 
             // 2-2) 이슈 템플릿의 "📦 도메인 이름" 입력값 (예: user, policy, ai, others)
             const domainValue = getField("📦 도메인 이름");
-            if (!domainValue || !domainFieldId) return;
+            if (!domainValue) return;
 
-            // 2-3) Domain 필드의 옵션 목록을 조회해 이름이 같은 옵션을 찾음 (대소문자 무시)
+            // 2-3) "Domain" 필드를 이름으로 직접 조회해 id와 옵션 목록을 함께 얻음
+            //      (필드 id를 별도 변수로 관리하지 않으므로 필드를 새로 만들거나 옵션을 바꿔도
+            //       변수를 다시 등록할 필요가 없습니다)
             const fieldResult = await github.graphql(`
               query($projectId: ID!) {
                 node(id: $projectId) {
@@ -77,8 +83,12 @@ jobs:
                 }
               }
             `, { projectId });
-            const options = fieldResult.node.field?.options || [];
-            const matched = options.find(o => o.name.toLowerCase() === domainValue.toLowerCase());
+            const domainField = fieldResult.node.field;
+            if (!domainField) {
+              core.warning('프로젝트에 "Domain"이라는 이름의 단일 선택 필드를 찾을 수 없습니다. 필드명을 확인해주세요.');
+              return;
+            }
+            const matched = domainField.options.find(o => o.name.toLowerCase() === domainValue.toLowerCase());
             if (!matched) {
               core.warning(`Domain 옵션 중 "${domainValue}" 와 일치하는 항목이 없습니다. (Project의 Domain 옵션 이름을 확인하세요)`);
               return;
@@ -91,9 +101,9 @@ jobs:
                   value: { singleSelectOptionId: $optionId }
                 }) { projectV2Item { id } }
               }
-            `, { projectId, itemId, fieldId: domainFieldId, optionId: matched.id });
+            `, { projectId, itemId, fieldId: domainField.id, optionId: matched.id });
 
-      # 3) Type 지정: "🌿 브랜치 타입" 값이 fix -> Bug, feat -> Feature, 나머지 전부 -> Task
+      # 3) Type 지정: "🌿 브랜치 타입" 값이 fix/hotfix -> Bug, feat -> Feature, 나머지 전부 -> Task
       - name: Set issue type
         uses: actions/github-script@v7
         with:
