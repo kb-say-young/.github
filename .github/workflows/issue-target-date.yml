@@ -4,13 +4,12 @@ name: Issue target date on close
 # 기존 파일은 건드리지 않는 별도 워크플로입니다.
 
 on:
-  issues:
-    types: [closed]
+  workflow_call:
 
 jobs:
   set-target-date:
     runs-on: ubuntu-latest
-    if: ${{ vars.PROJECT_ID != '' && secrets.PROJECTS_TOKEN != '' }}
+    if: ${{ vars.PROJECT_ID != '' }}
     steps:
       - name: Set Target date field to close date
         uses: actions/github-script@v7

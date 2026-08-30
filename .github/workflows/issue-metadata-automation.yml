@@ -6,8 +6,7 @@ name: Issue metadata automation
 # "🌿 브랜치 타입" 값(feat/fix/docs/...)을 인식해 처리하고 있어 이 워크플로에서는 건드리지 않습니다.
 
 on:
-  issues:
-    types: [opened]
+  workflow_call:
 
 permissions:
   issues: write
@@ -32,7 +31,7 @@ jobs:
       # 2) 이슈를 프로젝트(1개)에 자동 추가 + "📦 도메인 이름" 값으로 Domain 필드 매칭
       #    Projects v2 GraphQL은 기본 GITHUB_TOKEN 권한 밖이라 PAT(PROJECTS_TOKEN)가 필요합니다.
       - name: Add to project & set Domain field
-        if: ${{ vars.PROJECT_ID != '' && secrets.PROJECTS_TOKEN != '' }}
+        if: ${{ vars.PROJECT_ID != '' }}
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.PROJECTS_TOKEN }}
@@ -96,7 +95,6 @@ jobs:
 
       # 3) Type 지정: "🌿 브랜치 타입" 값이 fix -> Bug, feat -> Feature, 나머지 전부 -> Task
       - name: Set issue type
-        if: ${{ secrets.PROJECTS_TOKEN != '' }}
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.PROJECTS_TOKEN }}
