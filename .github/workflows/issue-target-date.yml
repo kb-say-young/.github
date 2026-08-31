@@ -2,72 +2,58 @@ name: Issue target date on close (reusable)
 
 # 이 파일도 kb-say-young/.github 리포에만 존재하는 재사용 가능한 워크플로입니다.
 # 각 저장소의 caller 워크플로가 uses: 로 호출해야 동작합니다.
+#
+# "Target date"는 Projects v2 필드가 아니라 조직 레벨 Issue Field라서,
+# 프로젝트 아이템을 거치지 않고 이슈에 직접 updateIssueFieldValue로 값을 씁니다.
 
 on:
   workflow_call:
     secrets:
       PROJECTS_TOKEN:
         required: false
-        description: "Projects(v2) 필드 수정 권한이 있는 fine-grained PAT"
+        description: "Issue field 값 수정 권한이 있는 fine-grained PAT"
 
 jobs:
   set-target-date:
     runs-on: ubuntu-latest
-    if: ${{ vars.PROJECT_ID != '' }}
     steps:
-      - name: Set Target date field to close date
+      - name: Set Target date issue field to close date
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.PROJECTS_TOKEN }}
           script: |
-            const projectId = "${{ vars.PROJECT_ID }}";
             const issueNodeId = context.payload.issue.node_id;
             const closedAt = context.payload.issue.closed_at; // ISO 8601
             const closeDate = closedAt.slice(0, 10); // YYYY-MM-DD
 
-            // 이슈가 속한 프로젝트 아이템 id 조회
-            const itemsResult = await github.graphql(`
-              query($issueId: ID!) {
-                node(id: $issueId) {
-                  ... on Issue {
-                    projectItems(first: 10) {
-                      nodes { id project { id } }
+            // 조직의 Issue Field 목록에서 이름이 "Target date"인 날짜 필드를 찾음
+            const fieldsResult = await github.graphql(`
+              query($org: String!) {
+                organization(login: $org) {
+                  issueFields(first: 100) {
+                    nodes {
+                      ... on IssueFieldDate {
+                        id
+                        name
+                      }
                     }
                   }
                 }
               }
-            `, { issueId: issueNodeId });
+            `, { org: context.repo.owner });
 
-            const items = itemsResult.node.projectItems.nodes;
-            const item = items.find(i => i.project.id === projectId);
-            if (!item) {
-              core.warning("이 이슈가 대상 프로젝트에 속해있지 않아 Target date를 설정할 수 없습니다.");
-              return;
-            }
-
-            // "Target date" 필드를 이름으로 직접 조회해 id를 얻음 (변수로 따로 관리하지 않음)
-            const fieldResult = await github.graphql(`
-              query($projectId: ID!) {
-                node(id: $projectId) {
-                  ... on ProjectV2 {
-                    field(name: "Target date") {
-                      ... on ProjectV2FieldCommon { id }
-                    }
-                  }
-                }
-              }
-            `, { projectId });
-            const targetDateField = fieldResult.node.field;
+            const fields = fieldsResult.organization.issueFields.nodes.filter(n => n && n.id);
+            const targetDateField = fields.find(f => f.name.toLowerCase() === "target date");
             if (!targetDateField) {
-              core.warning('프로젝트에 "Target date"라는 이름의 필드를 찾을 수 없습니다. 필드명을 확인해주세요.');
+              core.warning('조직에 "Target date"라는 이름의 날짜 Issue Field를 찾을 수 없습니다. 필드명을 확인해주세요.');
               return;
             }
 
             await github.graphql(`
-              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $date: Date!) {
-                updateProjectV2ItemFieldValue(input: {
-                  projectId: $projectId, itemId: $itemId, fieldId: $fieldId,
-                  value: { date: $date }
-                }) { projectV2Item { id } }
+              mutation($issueId: ID!, $fieldId: ID!, $date: String!) {
+                updateIssueFieldValue(input: {
+                  issueId: $issueId,
+                  issueField: { fieldId: $fieldId, dateValue: $date }
+                }) { clientMutationId }
               }
-            `, { projectId, itemId: item.id, fieldId: targetDateField.id, date: closeDate });
+            `, { issueId: issueNodeId, fieldId: targetDateField.id, date: closeDate });
